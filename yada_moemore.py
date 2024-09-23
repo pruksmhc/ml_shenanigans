@@ -115,13 +115,14 @@ class MLPFFN(nn.Module):
 class GateRouter(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.gate_linear = nn.Linear(config.n_embd, config.n_experts)           
+        self.gate_linear = nn.Linear(config.n_embd, config.n_experts)  
+         
     def forward(self, x):
         gate_ffn = self.gate_linear(x)
-        _, topk_indices  = torch.topk(gate_ffn, k=2, dim=-1)
+        topk_values, topk_indices  = torch.topk(gate_ffn, k=2, dim=-1)
         mask = torch.full_like(gate_ffn, float("-inf"))
-        mask.scatter(dim=-1, index=topk_indices, value=1.0)
-        gate_weight = F.softmax(torch.multiply(mask, gate_ffn), dim=-1)
+        mask = mask.scatter(dim=-1, index=topk_indices, src=topk_values)
+        gate_weight = F.softmax(mask, dim=-1)
         return gate_weight, topk_indices
 
 class SparseMOE(nn.Module):
@@ -134,15 +135,13 @@ class SparseMOE(nn.Module):
       self.experts = nn.ModuleList([MLPFFN(config) for _ in range(config.n_experts)])
 
   def forward(self, x):
-        # LET'S TRY TO ANNOTATE!
         # Assuming x has shape [batch_size, seq_len, n_embd]
         batch_size, seq_len, _ = x.shape
         gating_output, indices = self.router(x) # gating_output is [batch_size, seq_len, n_experts]
 
         # Flatten the batch and sequence dimensions to treat each token independently
         flat_x = x.view(-1, x.size(-1))  # basically flatten all dimensions except last, [batch_size * seq_len, n_embd]
-        flat_gating_output = gating_output.view(-1, gating_output.size(-1))
-        # [batch_size * seq_len, n_experts]
+        flat_gating_output = gating_output.view(-1, gating_output.size(-1))# [batch_size * seq_len, n_experts]
 
         tokens_per_batch = batch_size * seq_len * self.top_k # tokens that need to be preocessed. 
         expert_capacity = int((tokens_per_batch / self.num_experts) * self.capacity_factor) # total number of experts, capcity of the entire model to hold information on the tokens. 
@@ -151,7 +150,7 @@ class SparseMOE(nn.Module):
 
         for i, expert in enumerate(self.experts):
             # For each batch, it will pass through two experts, but you do it one expert at a time. 
-            expert_mask = (indices == i).any(dim=-1) # [batch_size * seq_len, 1 ] , where k is the selected indices. 
+            expert_mask = (indices == i).any(dim=-1) # [batch_size * seq_len, 1 ]. 
             flat_mask = expert_mask.view(-1) # [batch_size * seq_len]
             selected_indices = torch.nonzero(flat_mask).squeeze(-1)
             limited_indices = selected_indices[:expert_capacity] if selected_indices.numel() > expert_capacity else selected_indices
@@ -161,7 +160,6 @@ class SparseMOE(nn.Module):
                 gating_scores = flat_gating_output[limited_indices, i].unsqueeze(1)
                 weighted_output = expert_output * gating_scores
                 updates.index_add_(0, limited_indices, weighted_output)
-        breakpoint()
         return updates.view(batch_size, seq_len, -1)
   
 class Block(nn.Module):
@@ -173,7 +171,6 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.smoe = SparseMOE(config)
-        self.mlp = MLP(config)
 
     def forward(self, x):
         # x - batch_size, seq_len, emb_dim
@@ -509,7 +506,6 @@ def generate(model, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k
         idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
         # forward the model to get the logits for the index in the sequence
         logits, _ = model(idx_cond)
-        breakpoint()
         # pluck the logits at the final step and scale by desired temperature
         logits = logits[:, -1, :] / temperature
         # optionally crop the logits to only the top k options
@@ -564,9 +560,7 @@ def evaluate(model, dataset, batch_size=50, max_batches=None):
     for i, batch in enumerate(loader):
         batch = [t.to(args.device) for t in batch]
         X, Y = batch
-        logits, loss = model(X, Y)
-        model_graph = draw_graph(model, X,  save_graph=True, filename="try")
-        breakpoint()
+        _, loss = model(X, Y)
         losses.append(loss.item())
         if max_batches is not None and i >= max_batches:
             break
